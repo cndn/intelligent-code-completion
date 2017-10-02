@@ -86,5 +86,8 @@ def tokenize_code(string, concat_symbol=None):
 
 # In[ ]:
 
+if __name__ == '__main__':
+    f = open('../data/setup.py','r')
+    print tokenize_code(f.read())
 
 
