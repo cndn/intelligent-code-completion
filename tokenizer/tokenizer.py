@@ -84,10 +84,12 @@ def tokenize_code(string, concat_symbol=None):
     return tokens
 
 
-# In[ ]:
+# In[9]:
+def tokenize_code_without_id(string, concat_symbol=None):
+    return [val for (id, val) in tokenize_code(string, concat_symbol)]
 
 if __name__ == '__main__':
-    f = open('../data/setup.py','r')
-    print tokenize_code(f.read())
+    f = open('../dataset/split.py','r')
+    print tokenize_code_without_id(f.read())
 
 

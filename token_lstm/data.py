@@ -38,7 +38,7 @@ class Corpus(object):
                 try:
                     with open(code_path, 'r') as code_f:
                         code = code_f.read()
-                        words = tokenizer.tokenize_code(code) + ['<eos>']
+                        words = tokenizer.tokenize_code_without_id(code) + ['<eos>']
                         tokens += len(words)
                         for word in words:
                             self.dictionary.add_word(word)
@@ -56,7 +56,7 @@ class Corpus(object):
                 try:
                     with open(code_path, 'r') as code_f:
                         code = code_f.read()
-                        words = tokenizer.tokenize_code(code) + ['<eos>']
+                        words = tokenizer.tokenize_code_without_id(code) + ['<eos>']
                         for word in words:
                             ids[token] = self.dictionary.word2idx[word]
                             token += 1
