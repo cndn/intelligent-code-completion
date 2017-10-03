@@ -1,0 +1,87 @@
+# Modified from original implementation by Dominik Wabersich (2013)
+
+import numpy as np
+import numpy.random as nr
+
+from .arraystep import ArrayStep, Competence
+from ..model import modelcontext
+from ..theanof import inputvars
+from ..vartypes import continuous_types
+
+__all__ = ['Slice']
+
+
+class Slice(ArrayStep):
+    """
+    Univariate slice sampler step method
+
+    Parameters
+    ----------
+    vars : list
+        List of variables for sampler.
+    w : float
+        Initial width of slice (Defaults to 1).
+    tune : bool
+        Flag for tuning (Defaults to True).
+    model : PyMC Model
+        Optional model for sampling step. Defaults to None (taken from context).
+
+    """
+    name = 'slice'
+    default_blocked = False
+
+    def __init__(self, vars=None, w=1., tune=True, model=None, **kwargs):
+        self.model = modelcontext(model)
+        self.w = w
+        self.tune = tune
+        self.n_tunes = 0.
+
+        if vars is None:
+            vars = self.model.cont_vars
+        vars = inputvars(vars)
+
+        super(Slice, self).__init__(vars, [self.model.fastlogp], **kwargs)
+
+    def astep(self, q0, logp):
+        self.w = np.resize(self.w, len(q0))  # this is a repmat
+        q = np.copy(q0)  # TODO: find out if we need this
+        ql = np.copy(q0)  # l for left boundary
+        qr = np.copy(q0)  # r for right boudary
+        for i in range(len(q0)):
+            # uniformly sample from 0 to p(q), but in log space
+            y = logp(q) - nr.standard_exponential()
+            ql[i] = q[i] - nr.uniform(0, self.w[i])
+            qr[i] = q[i] + self.w[i]
+            # Stepping out procedure
+            while(y <= logp(ql)):  # changed lt to leq  for locally uniform posteriors
+                ql[i] -= self.w[i]
+            while(y <= logp(qr)):
+                qr[i] += self.w[i]
+
+            q[i] = nr.uniform(ql[i], qr[i])
+            while logp(q) < y:  # Changed leq to lt, to accomodate for locally flat posteriors
+                # Sample uniformly from slice
+                if q[i] > q0[i]:
+                    qr[i] = q[i]
+                elif q[i] < q0[i]:
+                    ql[i] = q[i]
+                q[i] = nr.uniform(ql[i], qr[i])
+
+            if self.tune:  # I was under impression from MacKays lectures that slice width can be tuned without
+                # breaking markovianness. Can we do it regardless of self.tune?(@madanh)
+                self.w[i] = self.w[i] * (self.n_tunes / (self.n_tunes + 1)) +\
+                    (qr[i] - ql[i]) / (self.n_tunes + 1)  # same as before
+            # unobvious and important: return qr and ql to the same point
+                qr[i] = q[i]
+                ql[i] = q[i]
+        if self.tune:
+            self.n_tunes += 1
+        return q
+
+    @staticmethod
+    def competence(var):
+        if var.dtype in continuous_types:
+            if not var.shape:
+                return Competence.PREFERRED
+            return Competence.COMPATIBLE
+        return Competence.INCOMPATIBLE

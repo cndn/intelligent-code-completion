@@ -1,0 +1,1374 @@
+# -*- coding: utf-8 -*-
+import time
+import urllib
+
+import mock
+import pytest
+from constance import config
+from constance.test import override_config
+from django.conf import settings
+from django.contrib.auth.models import Group
+from django.contrib.sites.models import Site
+from django.core import mail
+from django.test.utils import override_settings
+from django.utils import translation
+from django.utils.http import urlquote
+from django.utils.six.moves.urllib.parse import urlparse, parse_qs
+from pyquery import PyQuery as pq
+
+from kuma.core.tests import eq_, ok_
+from kuma.core.urlresolvers import reverse
+from kuma.core.utils import urlparams
+from kuma.users.models import User
+from kuma.users.tests import UserTestCase
+
+from . import (WikiTestCase, create_topical_parents_docs, document,
+               new_document_data, revision)
+from ..constants import (EXPERIMENT_TITLE_PREFIX, REDIRECT_CONTENT)
+from ..events import EditDocumentEvent
+from ..models import Document, DocumentTag, Revision
+
+
+DOCUMENT_EDITED_EMAIL_CONTENT = """
+
+
+admin created a new revision to the document
+%s.
+
+To view this document's history, click the following
+link, or paste it into your browser's location bar:
+
+https://testserver/en-US/docs/%s$history
+"""
+
+
+class DocumentTests(UserTestCase, WikiTestCase):
+    """Tests for the Document template"""
+
+    def test_document_view(self):
+        """Load the document view page and verify the title and content."""
+        r = revision(save=True, content='Some text.', is_approved=True)
+        response = self.client.get(r.document.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(r.document.title, doc('main#content div.document-head h1').text())
+        eq_(r.document.html, doc('article#wikiArticle').text())
+
+    @pytest.mark.breadcrumbs
+    def test_document_breadcrumbs(self):
+        """Create docs with topical parent/child rel, verify breadcrumbs."""
+        d1, d2 = create_topical_parents_docs()
+        response = self.client.get(d1.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(d1.title, doc('main#content div.document-head h1').text())
+        eq_(d1.title, doc('nav.crumbs li:last-child').text())
+        response = self.client.get(d2.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(d2.title, doc('main#content div.document-head h1').text())
+        crumbs = "MDN %s %s" % (d1.title, d2.title)
+        eq_(crumbs, doc('nav.crumbs').text())
+
+    def test_english_document_no_approved_content(self):
+        """Load an English document with no approved content."""
+        r = revision(save=True, content='Some text.', is_approved=False)
+        response = self.client.get(r.document.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(r.document.title, doc('main#content div.document-head h1').text())
+        eq_("This article doesn't have approved content yet.",
+            doc('article#wikiArticle').text())
+
+    def test_translation_document_no_approved_content(self):
+        """Load a non-English document with no approved content, with a parent
+        with no approved content either."""
+        r = revision(save=True, content='Some text.', is_approved=False)
+        d2 = document(parent=r.document, locale='fr', slug='french', save=True)
+        revision(document=d2, save=True, content='Moartext', is_approved=False)
+        response = self.client.get(d2.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(d2.title, doc('main#content div.document-head h1').text())
+        # HACK: fr doc has different message if locale/ is updated
+        ok_(
+            ("This article doesn't have approved content yet." in
+                doc('article#wikiArticle').text()) or
+            ("Cet article n'a pas encore de contenu" in
+                doc('article#wikiArticle').text())
+        )
+
+    def test_document_fallback_with_translation(self):
+        """The document template falls back to English if translation exists
+        but it has no approved revisions."""
+        r = revision(save=True, content='Test', is_approved=True)
+        d2 = document(parent=r.document, locale='fr', slug='french', save=True)
+        revision(document=d2, is_approved=False, save=True)
+        url = reverse('wiki.document', args=[d2.slug], locale='fr')
+        response = self.client.get(url)
+        doc = pq(response.content)
+        eq_(d2.title, doc('main#content div.document-head h1').text())
+
+        # Fallback message is shown.
+        eq_(1, len(doc('#doc-pending-fallback')))
+        ok_('$translate' in doc('#edit-button').attr('href'))
+        # Removing this as it shows up in text(), and we don't want to depend
+        # on its localization.
+        doc('#doc-pending-fallback').remove()
+        # Included content is English.
+        eq_(pq(r.document.html).text(), doc('article#wikiArticle').text())
+
+    def test_document_fallback_no_translation(self):
+        """The document template falls back to English if no translation
+        exists."""
+        r = revision(save=True, content='Some text.', is_approved=True)
+        url = reverse('wiki.document', args=[r.document.slug], locale='fr')
+        response = self.client.get(url)
+        doc = pq(response.content)
+        eq_(r.document.title, doc('main#content div.document-head h1').text())
+
+        # Fallback message is shown.
+        eq_(1, len(doc('#doc-pending-fallback')))
+        ok_('$translate' in doc('#edit-button').attr('href'))
+        # Removing this as it shows up in text(), and we don't want to depend
+        # on its localization.
+        doc('#doc-pending-fallback').remove()
+        # Included content is English.
+        eq_(pq(r.document.html).text(), doc('article#wikiArticle').text())
+
+    def test_redirect(self):
+        """Make sure documents with REDIRECT directives redirect properly.
+
+        Also check the backlink to the redirect page.
+        """
+        target = document(save=True)
+        target_url = target.get_absolute_url()
+
+        # Ordinarily, a document with no approved revisions cannot have HTML,
+        # but we shove it in manually here as a shortcut:
+        redirect_html = REDIRECT_CONTENT % dict(title='Boo', href=target_url)
+        redirect = document(html=redirect_html)
+        redirect.save()
+        redirect_url = redirect.get_absolute_url()
+
+        self.client.login(username='admin', password='testpass')
+        response = self.client.get(redirect_url, follow=True)
+        self.assertRedirects(response, urlparams(target_url), status_code=301)
+        self.assertContains(response, redirect_url)
+
+    def test_redirect_from_nonexistent(self):
+        """The template shouldn't crash or print a backlink if the "from" page
+        doesn't exist."""
+        d = document(save=True)
+        response = self.client.get(urlparams(d.get_absolute_url()))
+        self.assertNotContains(response, 'Redirected from ')
+
+    def test_watch_includes_csrf(self):
+        """The watch/unwatch forms should include the csrf tag."""
+        self.client.login(username='testuser', password='testpass')
+        d = document(save=True)
+        resp = self.client.get(d.get_absolute_url())
+        doc = pq(resp.content)
+        assert doc('.page-watch input[type=hidden]')
+
+    def test_non_localizable_translate_disabled(self):
+        """Non localizable document doesn't show tab for 'Localize'."""
+        self.client.login(username='testuser', password='testpass')
+        d = document(is_localizable=True, save=True)
+        resp = self.client.get(d.get_absolute_url())
+        doc = pq(resp.content)
+        assert 'Add a translation' in doc('.page-buttons #translations li').text()
+
+        # Make it non-localizable
+        d.is_localizable = False
+        d.save()
+        resp = self.client.get(d.get_absolute_url())
+        doc = pq(resp.content)
+        assert 'Add a translation' not in doc('.page-buttons #translations li').text()
+
+    @pytest.mark.toc
+    def test_toc_depth(self):
+        """Toggling show_toc on/off through the toc_depth field should
+        cause table of contents to appear/disappear."""
+        doc_content = """
+        <h2>This is a section</h2>
+        <p>This is section content.</p>
+        <h2>This is another section</h2>
+        <p>This is more section content.</p>
+        """
+        r = revision(save=True, content=doc_content, is_approved=True)
+        response = self.client.get(r.document.get_absolute_url())
+        eq_(200, response.status_code)
+        ok_('<div id="toc"' in response.content)
+        new_r = revision(document=r.document, content=r.content,
+                         toc_depth=0, is_approved=True)
+        new_r.save()
+        response = self.client.get(r.document.get_absolute_url())
+        eq_(200, response.status_code)
+        ok_('<div class="page-toc">' not in response.content)
+
+    def test_lang_switcher_footer(self):
+        """Test the language switcher footer"""
+        parent = document(locale=settings.WIKI_DEFAULT_LANGUAGE, save=True)
+        trans_bn_bd = document(parent=parent, locale="bn-BD", save=True)
+        trans_ar = document(parent=parent, locale="ar", save=True)
+        trans_pt_br = document(parent=parent, locale="pt-BR", save=True)
+        trans_fr = document(parent=parent, locale="fr", save=True)
+
+        response = self.client.get(trans_pt_br.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        options = doc(".languages.go select.wiki-l10n option")
+
+        # The requeseted document language name should be at first
+        ok_(trans_pt_br.language in options[0].text)
+        ok_(parent.language not in options[0].text)
+        # The parent document language should be at at second
+        ok_(parent.language in options[1].text)
+        ok_(trans_ar.language not in options[1].text)
+        # Then should be ar, bn-BD, fr
+        ok_(trans_ar.language in options[2].text)
+        ok_(trans_bn_bd.language in options[3].text)
+        ok_(trans_fr.language in options[4].text)
+
+    def test_lang_switcher_button(self):
+        parent = document(locale=settings.WIKI_DEFAULT_LANGUAGE, save=True)
+        trans_bn_bd = document(parent=parent, locale="bn-BD", save=True)
+        trans_ar = document(parent=parent, locale="ar", save=True)
+        trans_pt_br = document(parent=parent, locale="pt-BR", save=True)
+        trans_fr = document(parent=parent, locale="fr", save=True)
+
+        response = self.client.get(trans_pt_br.get_absolute_url())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        options = doc("#languages-menu-submenu ul#translations li a")
+
+        # The requeseted document language name should not be at button
+        ok_(trans_pt_br.language not in options[0].text)
+        # Parent document language name should be at first
+        ok_(parent.language in options[0].text)
+        # Then should be ar, bn-BD, fr
+        ok_(trans_ar.language in options[1].text)
+        ok_(trans_bn_bd.language in options[2].text)
+        ok_(trans_fr.language in options[3].text)
+
+    def test_experiment_document_view(self):
+        slug = EXPERIMENT_TITLE_PREFIX + 'Test'
+        r = revision(save=True, content='Experiment.', is_approved=True,
+                     slug=slug)
+        assert r.document.is_experiment
+        response = self.client.get(r.document.get_absolute_url())
+        assert response.status_code == 200
+        doc = pq(response.content)
+        doc_title = doc('main#content div.document-head h1').text()
+        assert doc_title == r.document.title
+        assert doc('article#wikiArticle').text() == r.document.html
+        metas = doc("meta[name='robots']")
+        assert len(metas) == 1
+        meta_content = metas[0].get('content')
+        assert meta_content == 'noindex, nofollow'
+        doc_experiment = doc('div#doc-experiment')
+        assert len(doc_experiment) == 1
+
+
+_TEST_CONTENT_EXPERIMENTS = [{
+    'id': 'experiment-test',
+    'ga_name': 'experiment-test',
+    'param': 'v',
+    'pages': {
+        'en-US:Original': {
+            'control': 'Original',
+            'test': 'Experiment:Test/Variant',
+        }
+    }
+}]
+_PIPELINE = settings.PIPELINE
+_PIPELINE['JAVASCRIPT']['experiment-test'] = {
+    'output_filename': 'build/js/experiment-framework-test.js',
+}
+
+
+@override_settings(CONTENT_EXPERIMENTS=_TEST_CONTENT_EXPERIMENTS,
+                   PIPELINE=_PIPELINE)
+@override_config(GOOGLE_ANALYTICS_ACCOUNT='fake')
+class DocumentContentExperimentTests(UserTestCase, WikiTestCase):
+
+    # src attribute of the content experiment <script> tag
+    # Can't use pyquery for <head> elements
+    script_src = 'src="/static/build/js/experiment-framework-test.js"'
+
+    # Googla Analytics custom dimension calls
+    expected_15 = "ga('set', 'dimension15', 'experiment-test:test')"
+    expected_16 = "ga('set', 'dimension16', '/en-US/docs/Original')"
+
+    def test_anon_no_variant_selected(self):
+        """Anonymous users get the experiment script on the original page."""
+        rev = revision(save=True, content='Original Content.', is_approved=True,
+                       slug='Original')
+        response = self.client.get(rev.document.get_absolute_url())
+        assert response.status_code == 200
+        assert 'Original Content.' in response.content
+        assert 'dimension15' not in response.content
+        assert self.script_src in response.content
+
+    def test_user_no_variant_selected(self):
+        """Users get original page without the experiment script."""
+        rev = revision(save=True, content='Original Content.', is_approved=True,
+                       slug='Original')
+        self.client.login(username='testuser', password='testpass')
+        response = self.client.get(rev.document.get_absolute_url())
+        assert response.status_code == 200
+        assert self.script_src not in response.content
+
+    def test_anon_valid_variant_selected(self):
+        """Anon users are in the Google Analytics cohort on the variant."""
+        rev = revision(save=True, content='Original Content.', is_approved=True,
+                       slug='Original')
+        revision(save=True, content='Variant Content.', is_approved=True,
+                 slug='Experiment:Test/Variant')
+        response = self.client.get(rev.document.get_absolute_url(),
+                                   {'v': 'test'})
+        assert response.status_code == 200
+        assert 'Original Content.' not in response.content
+        assert 'Variant Content.' in response.content
+        assert self.expected_15 in response.content
+        assert self.expected_16 in response.content
+        assert self.script_src not in response.content
+        doc = pq(response.content)
+        assert not doc('#edit-button')
+
+    def test_user_valid_variant_selected(self):
+        """Users are not added to the Google Analytics cohort on the variant."""
+        rev = revision(save=True, content='Original Content.', is_approved=True,
+                       slug='Original')
+        revision(save=True, content='Variant Content.', is_approved=True,
+                 slug='Experiment:Test/Variant')
+        self.client.login(username='testuser', password='testpass')
+        response = self.client.get(rev.document.get_absolute_url(),
+                                   {'v': 'test'})
+        assert response.status_code == 200
+        assert 'Original Content.' not in response.content
+        assert 'Variant Content.' in response.content
+        assert self.expected_15 not in response.content
+        assert self.expected_16 not in response.content
+        assert self.script_src not in response.content
+        doc = pq(response.content)
+        assert not doc('#edit-button')
+
+
+@override_config(GOOGLE_ANALYTICS_ACCOUNT='fake')
+class GoogleAnalyticsTests(UserTestCase, WikiTestCase):
+
+    ga_create = "ga('create', 'fake', 'mozilla.org');"
+    dim1 = "ga('set', 'dimension1', 'Yes');"
+    dim2 = "ga('set', 'dimension2', 'Yes');"
+    dim17_tmpl = "ga('set', 'dimension17', '%s');"
+    dim18 = "ga('set', 'dimension18', 'Yes');"
+
+    def test_en_doc(self):
+        doc = _create_document()
+        assert doc.slug
+        response = self.client.get(doc.get_absolute_url())
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        dim17 = self.dim17_tmpl % doc.slug
+        assert dim17 in content
+
+    def test_fr_doc(self):
+        en_doc = _create_document(title='English Document')
+        fr_doc = _create_document(title=u'Document Français',
+                                  parent=en_doc, locale='fr')
+        assert en_doc.slug != fr_doc.slug
+        response = self.client.get(fr_doc.get_absolute_url())
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        dim17 = self.dim17_tmpl % en_doc.slug
+        assert dim17 in content
+
+    def test_orphan_doc(self):
+        orphan_doc = _create_document(title=u'Huérfano', locale='es')
+        response = self.client.get(orphan_doc.get_absolute_url())
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        dim17 = "ga('set', 'dimension17',"
+        assert dim17 not in content
+
+    def test_anon_user(self):
+        response = self.client.get('/en-US/')
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        assert self.dim1 not in content
+        assert self.dim2 not in content
+        assert self.dim18 not in content
+
+    def test_regular_user(self):
+        assert self.client.login(username='testuser', password='testpass')
+        response = self.client.get('/en-US/')
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        assert self.dim1 in content
+        assert self.dim2 not in content
+        assert self.dim18 not in content
+
+    def test_beta_user(self):
+        testuser = User.objects.get(username='testuser')
+        beta = Group.objects.get(name='Beta Testers')
+        testuser.groups.add(beta)
+        assert self.client.login(username='testuser', password='testpass')
+        response = self.client.get('/en-US/')
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        assert self.dim1 in content
+        assert self.dim2 in content
+        assert self.dim18 not in content
+
+    def test_staff_user(self):
+        assert self.client.login(username='admin', password='testpass')
+        response = self.client.get('/en-US/')
+        assert response.status_code == 200
+        content = response.content.decode('utf8')
+        assert self.ga_create in content
+        assert self.dim1 in content
+        assert self.dim2 not in content
+        assert self.dim18 in content
+
+
+def test_revision_template(root_doc, client):
+    """Verify the revision template."""
+    rev = root_doc.current_revision
+    url = reverse('wiki.revision', args=[root_doc.slug, rev.id], locale=root_doc.locale)
+    response = client.get(url)
+    assert response.status_code == 200
+    page = pq(response.content)
+    assert page('h1').text() == 'Revision %s of %s' % (rev.id, root_doc.title)
+    assert page('#doc-source pre').text() == rev.content
+    assert page('span[data-name="slug"]').text() == root_doc.slug
+    assert page('span[data-name="title"]').text() == root_doc.title
+    assert page('span[data-name="id"]').text() == str(rev.id)
+    expected_date = 'Apr 14, 2017, 12:15:00 PM'
+    assert page('span[data-name="created"]').text() == expected_date
+    assert page('span[data-name="creator"]').text() == rev.creator.username
+    assert page('span[data-name="comment"]').text() == rev.comment
+    is_current = page('span[data-name="is-current"]')
+    assert is_current.text() == "Yes"
+    assert is_current.attr['data-value'] == "1"
+
+
+class NewDocumentTests(UserTestCase, WikiTestCase):
+    """Tests for the New Document template"""
+    localizing_client = True
+
+    def test_new_document_GET_with_perm(self):
+        """HTTP GET to new document URL renders the form."""
+        self.client.login(username='admin', password='testpass')
+        response = self.client.get(reverse('wiki.create'))
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(1, len(doc('form#wiki-page-edit input[name="title"]')))
+
+    def test_new_document_includes_review_block(self):
+        """
+        New document page includes 'Review Needed?' section.
+        https://bugzil.la/1052047
+        """
+        self.client.login(username='admin', password='testpass')
+        response = self.client.get(reverse('wiki.create'))
+
+        test_strings = ['Review needed?', 'Technical', 'Editorial']
+        eq_(200, response.status_code)
+
+        # TODO: push test_strings functionality up into a test helper
+        for test_string in test_strings:
+            ok_(test_string in response.content)
+
+    def test_new_document_preview_button(self):
+        """HTTP GET to new document URL shows preview button."""
+        self.client.login(username='admin', password='testpass')
+        response = self.client.get(reverse('wiki.create'))
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        ok_(len(doc('.btn-preview')) > 0)
+
+    def test_new_document_form_defaults(self):
+        """The new document form should have all all 'Relevant to' options
+        checked by default."""
+        self.client.login(username='admin', password='testpass')
+        response = self.client.get(reverse('wiki.create'))
+        doc = pq(response.content)
+        eq_("Name Your Article", doc('input#id_title').attr('placeholder'))
+
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_new_document_POST(self, get_current):
+        """HTTP POST to new document URL creates the document."""
+        get_current.return_value.domain = 'testserver'
+
+        self.client.login(username='admin', password='testpass')
+        tags = ['tag1', 'tag2']
+        data = new_document_data(tags)
+        response = self.client.post(reverse('wiki.create'), data,
+                                    follow=True)
+        d = Document.objects.get(title=data['title'])
+        eq_([('http://testserver/en-US/docs/%s' % d.slug, 302)],
+            response.redirect_chain)
+        eq_(settings.WIKI_DEFAULT_LANGUAGE, d.locale)
+        eq_(tags, sorted(t.name for t in d.tags.all()))
+        r = d.revisions.all()[0]
+        eq_(data['keywords'], r.keywords)
+        eq_(data['summary'], r.summary)
+        eq_(data['content'], r.content)
+
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_new_document_other_locale(self, get_current):
+        """Make sure we can create a document in a non-default locale."""
+        # You shouldn't be able to make a new doc in a non-default locale
+        # without marking it as non-localizable. Unskip this when the non-
+        # localizable bool is implemented.
+        get_current.return_value.domain = 'testserver'
+
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data(['tag1', 'tag2'])
+        locale = 'es'
+        self.client.post(reverse('wiki.create', locale=locale),
+                         data, follow=True)
+        d = Document.objects.get(title=data['title'])
+        eq_(locale, d.locale)
+
+    def test_new_document_POST_empty_title(self):
+        """Trigger required field validation for title."""
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data(['tag1', 'tag2'])
+        data['title'] = ''
+        response = self.client.post(reverse('wiki.create'), data,
+                                    follow=True)
+        doc = pq(response.content)
+        ul = doc('article ul.errorlist')
+        ok_(len(ul) > 0)
+        ok_('Please provide a title.' in ul('li').text())
+
+    def test_new_document_POST_empty_content(self):
+        """Trigger required field validation for content."""
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data(['tag1', 'tag2'])
+        data['content'] = ''
+        response = self.client.post(reverse('wiki.create'), data,
+                                    follow=True)
+        doc = pq(response.content)
+        ul = doc('article ul.errorlist')
+        eq_(1, len(ul))
+        eq_('Please provide content.', ul('li').text())
+
+    def test_slug_collision_validation(self):
+        """Trying to create document with existing locale/slug should
+        show validation error."""
+        d = _create_document()
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data()
+        data['slug'] = d.slug
+        response = self.client.post(reverse('wiki.create'), data)
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        ul = doc('article ul.errorlist')
+        eq_(1, len(ul))
+        eq_('Document with this Slug and Locale already exists.',
+            ul('li').text())
+
+    def test_title_no_collision(self):
+        """Only slugs and not titles are required to be unique per
+        locale now, so test that we actually allow that."""
+        d = _create_document()
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data()
+        data['slug'] = '%s-once-more-with-feeling' % d.slug
+        response = self.client.post(reverse('wiki.create'), data)
+        eq_(302, response.status_code)
+
+    def test_slug_3_chars(self):
+        """Make sure we can create a slug with only 3 characters."""
+        self.client.login(username='admin', password='testpass')
+        data = new_document_data()
+        data['slug'] = 'ask'
+        response = self.client.post(reverse('wiki.create'), data)
+        eq_(302, response.status_code)
+        eq_('ask', Document.objects.all()[0].slug)
+
+
+class NewRevisionTests(UserTestCase, WikiTestCase):
+    """Tests for the New Revision template"""
+    localizing_client = True
+
+    def setUp(self):
+        super(NewRevisionTests, self).setUp()
+        self.d = _create_document()
+        self.username = 'admin'
+        self.client.login(username=self.username, password='testpass')
+
+    def test_new_revision_GET_logged_out(self):
+        """Creating a revision without being logged in redirects to login page.
+        """
+        self.client.logout()
+        response = self.client.get(reverse('wiki.edit',
+                                           args=[self.d.slug]))
+        eq_(302, response.status_code)
+
+    def test_new_revision_GET_with_perm(self):
+        """HTTP GET to new revision URL renders the form."""
+        response = self.client.get(reverse('wiki.edit',
+                                           args=[self.d.slug]))
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(1, len(doc('article#edit-document '
+                       'form#wiki-page-edit textarea[name="content"]')))
+
+    def test_new_revision_GET_based_on(self):
+        """HTTP GET to new revision URL based on another revision.
+
+        This case should render the form with the fields pre-populated
+        with the based-on revision info.
+
+        """
+        r = Revision(document=self.d, keywords='ky1, kw2',
+                     summary='the summary',
+                     content='<div>The content here</div>', creator_id=7)
+        r.save()
+        response = self.client.get(reverse('wiki.new_revision_based_on',
+                                           args=[self.d.slug, r.id]))
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        self.assertHTMLEqual(doc('#id_content')[0].value.strip(),
+                             r.content.strip())
+
+    @override_settings(TIDINGS_CONFIRM_ANONYMOUS_WATCHES=False)
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_new_revision_POST_document_with_current(self, get_current):
+        """HTTP POST to new revision URL creates the revision on a document.
+
+        The document in this case already has a current_revision, therefore
+        the document document fields are not editable.
+
+        Also assert that the edited and reviewable notifications go out.
+        """
+        get_current.return_value.domain = 'testserver'
+
+        # Sign up for notifications:
+        EditDocumentEvent.notify('sam@example.com', self.d).activate().save()
+
+        # Edit a document
+        data = {
+            'summary': 'A brief summary',
+            'content': 'The article content',
+            'keywords': 'keyword1 keyword2',
+            'slug': self.d.slug,
+            'toc_depth': 1,
+            'based_on': self.d.current_revision.id,
+            'form-type': 'rev',
+        }
+        edit_url = reverse('wiki.edit', args=[self.d.slug])
+        response = self.client.post(edit_url, data)
+        ok_(response.status_code in (200, 302))
+        eq_(2, self.d.revisions.count())
+        new_rev = self.d.revisions.order_by('-id')[0]
+        eq_(self.d.current_revision, new_rev.based_on)
+
+        # Assert notifications fired and have the expected content:
+        # 1 email for the first time edit notification
+        # 1 email for the EditDocumentEvent to sam@example.com
+        # Regression check:
+        # messing with context processors can
+        # cause notification emails to error
+        # and stop being sent.
+        time.sleep(1)
+        eq_(2, len(mail.outbox))
+        first_edit_email = mail.outbox[0]
+        expected_to = [config.EMAIL_LIST_SPAM_WATCH]
+        expected_subject = (
+            u'[MDN][%(loc)s] %(user)s made their first edit, to: %(title)s' %
+            {'loc': self.d.locale,
+             'user': new_rev.creator.username,
+             'title': self.d.title}
+        )
+        eq_(expected_subject, first_edit_email.subject)
+        eq_(expected_to, first_edit_email.to)
+
+        edited_email = mail.outbox[1]
+        expected_to = [u'sam@example.com']
+        expected_subject = (u'[MDN][en-US] Page "%s" changed by %s'
+                            % (self.d.title, new_rev.creator))
+        eq_(expected_subject, edited_email.subject)
+        eq_(expected_to, edited_email.to)
+        ok_('%s changed %s.' % (unicode(self.username), unicode(self.d.title))
+            in edited_email.body)
+        ok_(u'https://testserver/en-US/docs/%s$history?utm_campaign=' %
+            self.d.slug
+            in edited_email.body)
+
+    @mock.patch.object(EditDocumentEvent, 'fire')
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_new_revision_POST_document_without_current(
+            self, get_current, edited_fire):
+        """HTTP POST to new revision URL creates the revision on a document.
+
+        The document in this case doesn't have a current_revision, therefore
+        the document fields are open for editing.
+
+        """
+        get_current.return_value.domain = 'testserver'
+
+        self.d.current_revision = None
+        self.d.save()
+        tags = ['tag1', 'tag2', 'tag3']
+        data = new_document_data(tags)
+        data['form-type'] = 'rev'
+        response = self.client.post(reverse('wiki.edit',
+                                    args=[self.d.slug]), data)
+        eq_(302, response.status_code)
+        eq_(2, self.d.revisions.count())
+
+        new_rev = self.d.revisions.order_by('-id')[0]
+        # There are no approved revisions, so it's based_on nothing:
+        eq_(None, new_rev.based_on)
+        ok_(edited_fire.called)
+
+    def test_new_revision_POST_removes_old_tags(self):
+        """Changing the tags on a document removes the old tags from
+        that document."""
+        self.d.current_revision = None
+        self.d.save()
+        tags = [u'tag1', u'tag2', u'tag3']
+        self.d.tags.add(*tags)
+        result_tags = list(self.d.tags.names())
+        result_tags.sort()
+        eq_(tags, result_tags)
+        tags = [u'tag1', u'tag4']
+        data = new_document_data(tags)
+        data['form-type'] = 'rev'
+        self.client.post(reverse('wiki.edit',
+                                 args=[self.d.slug]),
+                         data)
+        result_tags = list(self.d.tags.names())
+        result_tags.sort()
+        eq_(tags, result_tags)
+
+    def test_new_form_maintains_based_on_rev(self):
+        """Revision.based_on should be the rev that was current when the Edit
+        button was clicked, even if other revisions happen while the user is
+        editing."""
+        _test_form_maintains_based_on_rev(
+            self.client, self.d, 'wiki.edit',
+            {'summary': 'Windy', 'content': 'gerbils', 'form-type': 'rev',
+             'slug': self.d.slug, 'toc_depth': 1},
+            locale='en-US')
+
+
+class DocumentEditTests(UserTestCase, WikiTestCase):
+    """Test the editing of document level fields."""
+    localizing_client = True
+
+    def setUp(self):
+        super(DocumentEditTests, self).setUp()
+        self.d = _create_document()
+        self.client.login(username='admin', password='testpass')
+
+    def test_can_save_document_with_translations(self):
+        """Make sure we can save a document with translations."""
+        # Create a translation
+        _create_document(title='Document Prueba', parent=self.d,
+                         locale='es')
+        # Make sure is_localizable hidden field is rendered
+        response = self.client.get(reverse('wiki.edit', args=[self.d.slug]),
+                                   follow=True)
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        data = new_document_data()
+        new_title = 'A brand new title'
+        data.update(title=new_title)
+        data['form-type'] = 'doc'
+        data.update(is_localizable='True')
+        response = self.client.post(reverse('wiki.edit', args=[self.d.slug]),
+                                    data, follow=True)
+        eq_(200, response.status_code)
+        doc = Document.objects.get(pk=self.d.pk)
+        eq_(new_title, doc.title)
+
+    def test_change_slug_case(self):
+        """Changing the case of some letters in the slug should work."""
+        data = new_document_data()
+        new_slug = 'Test-Document'
+        data.update(slug=new_slug)
+        data['form-type'] = 'doc'
+        response = self.client.post(reverse('wiki.edit', args=[self.d.slug]),
+                                    data, follow=True)
+        eq_(200, response.status_code)
+        doc = Document.objects.get(pk=self.d.pk)
+        eq_(new_slug, doc.slug)
+
+    def test_change_title_case(self):
+        """Changing the case of some letters in the title should work."""
+        data = new_document_data()
+        new_title = 'TeST DoCuMent'
+        data.update(title=new_title)
+        data['form-type'] = 'doc'
+        response = self.client.post(reverse('wiki.edit', args=[self.d.slug]),
+                                    data, follow=True)
+        eq_(200, response.status_code)
+        doc = Document.objects.get(pk=self.d.pk)
+        eq_(new_title, doc.title)
+
+
+class DocumentListTests(UserTestCase, WikiTestCase):
+    localizing_client = True
+
+    def setUp(self):
+        super(DocumentListTests, self).setUp()
+        self.locale = settings.WIKI_DEFAULT_LANGUAGE
+        self.doc = _create_document(locale=self.locale)
+        _create_document(locale=self.locale, title='Another one')
+
+        # Create a document in different locale to make sure it doesn't show
+        _create_document(parent=self.doc, locale='es')
+
+    def test_all_list(self):
+        """Verify the all documents list view."""
+        response = self.client.get(reverse('wiki.all_documents'))
+        doc = pq(response.content)
+        eq_(Document.objects.filter(locale=self.locale).count(),
+            len(doc('#document-list ul.document-list li')))
+
+    @pytest.mark.tags
+    def test_tag_list(self):
+        """Verify the tagged documents list view."""
+        tag = DocumentTag(name='Test Tag', slug='test-tag')
+        tag.save()
+        self.doc.tags.add(tag)
+        response = self.client.get(reverse('wiki.tag',
+                                   args=[tag.name]))
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(1, len(doc('#document-list ul.document-list li')))
+
+
+def test_compare_revisions(edit_revision, client):
+    """Comparing two valid revisions of the same document works."""
+    doc = edit_revision.document
+    first_revision = doc.revisions.first()
+    params = {'from': first_revision.id, 'to': edit_revision.id}
+    url = urlparams(reverse('wiki.compare_revisions', args=[doc.slug],
+                            locale=doc.locale), **params)
+
+    response = client.get(url)
+    assert response.status_code == 200
+    page = pq(response.content)
+    assert page('span.diff_sub').text() == u'Getting\xa0started...'
+    assert page('span.diff_add').text() == u'The\xa0root\xa0document.'
+
+    change_link = page('a.change-revisions')
+    assert change_link.text() == 'Change Revisions'
+    change_href = change_link.attr('href')
+    bits = urlparse(change_href)
+    assert bits.path == reverse('wiki.document_revisions', args=[doc.slug],
+                                locale=doc.locale)
+    assert parse_qs(bits.query) == {'locale': [doc.locale],
+                                    'origin': ['compare']}
+
+    rev_from_link = page('div.rev-from h3 a')
+    assert rev_from_link.text() == 'Revision %d:' % first_revision.id
+    from_href = rev_from_link.attr('href')
+    assert from_href == reverse('wiki.revision',
+                                args=[doc.slug, first_revision.id],
+                                locale=doc.locale)
+
+    rev_to_link = page('div.rev-to h3 a')
+    assert rev_to_link.text() == 'Revision %d:' % edit_revision.id
+    to_href = rev_to_link.attr('href')
+    assert to_href == reverse('wiki.revision',
+                              args=[doc.slug, edit_revision.id],
+                              locale=doc.locale)
+
+
+def test_compare_first_translation(trans_revision, client):
+    """A localized revision can be compared to an English source revision."""
+    fr_doc = trans_revision.document
+    en_revision = trans_revision.based_on
+    en_doc = en_revision.document
+    assert en_doc != fr_doc
+    params = {'from': en_revision.id, 'to': trans_revision.id}
+    url = urlparams(reverse('wiki.compare_revisions', args=[fr_doc.slug],
+                            locale=fr_doc.locale), **params)
+
+    response = client.get(url)
+    assert response.status_code == 200
+    page = pq(response.content)
+    assert page('span.diff_sub').text() == u'Getting\xa0started...'
+    assert page('span.diff_add').text() == u'Mise\xa0en\xa0route...'
+
+    # Change Revisions link goes to the French document history page
+    change_link = page('a.change-revisions')
+    change_href = change_link.attr('href')
+    bits = urlparse(change_href)
+    assert bits.path == reverse('wiki.document_revisions', args=[fr_doc.slug],
+                                locale=fr_doc.locale)
+    assert parse_qs(bits.query) == {'locale': [fr_doc.locale],
+                                    'origin': ['compare']}
+
+    # From revision link goes to the English document
+    rev_from_link = page('div.rev-from h3 a')
+    from_href = rev_from_link.attr('href')
+    assert from_href == reverse('wiki.revision',
+                                args=[en_doc.slug, en_revision.id],
+                                locale=en_doc.locale)
+
+    # To revision link goes to the French document
+    rev_to_link = page('div.rev-to h3 a')
+    to_href = rev_to_link.attr('href')
+    assert to_href == reverse('wiki.revision',
+                              args=[fr_doc.slug, trans_revision.id],
+                              locale=fr_doc.locale)
+
+
+class TranslateTests(UserTestCase, WikiTestCase):
+    """Tests for the Translate page"""
+
+    def setUp(self):
+        super(TranslateTests, self).setUp()
+        self.d = _create_document()
+        self.client.login(username='admin', password='testpass')
+
+    def _translate_uri(self):
+        translate_uri = reverse('wiki.translate',
+                                locale='en-US',
+                                args=[self.d.slug])
+        return '%s?tolocale=%s' % (translate_uri, 'es')
+
+    def test_translate_GET_logged_out(self):
+        """Try to create a translation while logged out."""
+        self.client.logout()
+        translate_uri = self._translate_uri()
+        response = self.client.get(translate_uri)
+        eq_(302, response.status_code)
+        expected_url = '%s?next=%s' % (reverse('account_login', locale='en-US'),
+                                       urlquote(translate_uri))
+        ok_(expected_url in response['Location'])
+
+    def test_translate_GET_with_perm(self):
+        """HTTP GET to translate URL renders the form."""
+        response = self.client.get(self._translate_uri())
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(1, len(doc('form textarea[name="content"]')))
+        # initial translation should include slug input
+        eq_(1, len(doc('form input[name="slug"]')))
+        assert (u'Espa' in doc('div.title-locale').text())
+
+    def test_translate_disallow(self):
+        """HTTP GET to translate URL returns 400 when not localizable."""
+        self.d.is_localizable = False
+        self.d.save()
+        response = self.client.get(self._translate_uri())
+        eq_(400, response.status_code)
+
+    def test_invalid_document_form(self):
+        """Make sure we handle invalid document form without a 500."""
+        translate_uri = self._translate_uri()
+        data = _translation_data()
+        data['slug'] = ''  # Invalid slug
+        response = self.client.post(translate_uri, data)
+        eq_(200, response.status_code)
+
+    def test_invalid_revision_form(self):
+        """When creating a new translation, an invalid revision form shouldn't
+        result in a new Document being created."""
+        translate_uri = self._translate_uri()
+        data = _translation_data()
+        data['content'] = ''  # Content is required
+        response = self.client.post(translate_uri, data)
+        eq_(200, response.status_code)
+        eq_(0, self.d.translations.count())
+
+    @mock.patch.object(EditDocumentEvent, 'fire')
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_first_translation_to_locale(self, get_current, edited_fire):
+        """Create the first translation of a doc to new locale."""
+        get_current.return_value.domain = 'testserver'
+
+        translate_uri = self._translate_uri()
+        data = _translation_data()
+        response = self.client.post(translate_uri, data)
+        eq_(302, response.status_code)
+        new_doc = Document.objects.get(slug=data['slug'])
+        eq_('es', new_doc.locale)
+        eq_(data['title'], new_doc.title)
+        eq_(self.d, new_doc.parent)
+        rev = new_doc.revisions.all()[0]
+        eq_(data['keywords'], rev.keywords)
+        eq_(data['summary'], rev.summary)
+        eq_(data['content'], rev.content)
+        ok_(edited_fire.called)
+
+    def _create_and_approve_first_translation(self):
+        """Returns the revision."""
+        # First create the first one with test above
+        self.test_first_translation_to_locale()
+        # Approve the translation
+        rev_es = Revision.objects.filter(document__locale='es')[0]
+        rev_es.is_approved = True
+        rev_es.save()
+        return rev_es
+
+    @mock.patch.object(EditDocumentEvent, 'fire')
+    @mock.patch.object(Site.objects, 'get_current')
+    def test_another_translation_to_locale(self, get_current, edited_fire):
+        """Create the second translation of a doc."""
+        get_current.return_value.domain = 'testserver'
+
+        rev_es = self._create_and_approve_first_translation()
+
+        # Create and approve a new en-US revision
+        rev_enUS = Revision(summary="lipsum",
+                            content='lorem ipsum dolor sit amet new',
+                            keywords='kw1 kw2',
+                            document=self.d, creator_id=8, is_approved=True)
+        rev_enUS.save()
+
+        # Verify the form renders with correct content
+        translate_uri = self._translate_uri()
+        response = self.client.get(translate_uri)
+        doc = pq(response.content)
+        eq_(rev_es.content, doc('#id_content').text())
+        eq_(rev_enUS.content, doc('article.approved .translate-rendered').text())
+
+        # Post the translation and verify
+        data = _translation_data()
+        data['content'] = 'loremo ipsumo doloro sito ameto nuevo'
+        response = self.client.post(translate_uri, data)
+        eq_(302, response.status_code)
+        eq_('http://testserver/es/docs/un-test-articulo?rev_saved=',
+            response['location'])
+        doc = Document.objects.get(slug=data['slug'])
+        rev = doc.revisions.filter(content=data['content'])[0]
+        eq_(data['keywords'], rev.keywords)
+        eq_(data['summary'], rev.summary)
+        eq_(data['content'], rev.content)
+        ok_(edited_fire.called)
+
+        # subsequent translations should NOT include slug input
+        self.client.logout()
+        self.client.login(username='testuser', password='testpass')
+        response = self.client.get(translate_uri)
+        doc = pq(response.content)
+        eq_(0, len(doc('form input[name="slug"]')))
+
+    @pytest.mark.xfail(reason='Figure out wtf is going on with this test')
+    def test_translate_form_maintains_based_on_rev(self):
+        """
+        Revision.based_on should be the rev that was current when the
+        Translate button was clicked, even if other revisions happen while the
+        user is editing.
+        """
+        _test_form_maintains_based_on_rev(self.client,
+                                          self.d,
+                                          'wiki.translate',
+                                          _translation_data(),
+                                          trans_lang='es',
+                                          locale='en-US')
+
+    def test_translate_update_doc_only(self):
+        """
+        Submitting the document form should update document.
+        No new revisions should be created.
+        """
+        rev_es = self._create_and_approve_first_translation()
+        translate_uri = self._translate_uri()
+        data = _translation_data()
+        new_title = 'Un nuevo titulo'
+        data['title'] = new_title
+        data['form-type'] = 'doc'
+        response = self.client.post(translate_uri, data)
+        eq_(302, response.status_code)
+        eq_('http://testserver/es/docs/un-test-articulo$edit'
+            '?opendescription=1',
+            response['location'])
+        revisions = rev_es.document.revisions.all()
+        eq_(1, revisions.count())  # No new revisions
+        d = Document.objects.get(id=rev_es.document.id)
+        eq_(new_title, d.title)  # Title is updated
+
+    def test_translate_update_rev_and_doc(self):
+        """
+        Submitting the revision form should create a new revision.
+        And since Kuma docs default to approved, should update doc too.
+        """
+        rev_es = self._create_and_approve_first_translation()
+        translate_uri = self._translate_uri()
+        data = _translation_data()
+        new_title = 'Un nuevo titulo'
+        data['title'] = new_title
+        data['form'] = 'rev'
+        response = self.client.post(translate_uri, data)
+        eq_(302, response.status_code)
+        eq_('http://testserver/es/docs/un-test-articulo?rev_saved=',
+            response['location'])
+        revisions = rev_es.document.revisions.all()
+        eq_(2, revisions.count())  # New revision is created
+        d = Document.objects.get(id=rev_es.document.id)
+        eq_(data['title'], d.title)  # Title isn't updated
+
+    def test_translate_form_content_fallback(self):
+        """
+        If there are existing but unapproved translations, prefill
+        content with latest.
+        """
+        self.test_first_translation_to_locale()
+        translate_uri = self._translate_uri()
+        response = self.client.get(translate_uri)
+        doc = pq(response.content)
+        document = Document.objects.filter(locale='es')[0]
+        existing_rev = document.revisions.all()[0]
+        eq_(existing_rev.content, doc('#id_content').text())
+
+    @pytest.mark.xfail(reason='Figure out wtf is going on with this test.')
+    def test_translate_based_on(self):
+        """Test translating based on a non-current revision."""
+        # Create the base revision
+        base_rev = self._create_and_approve_first_translation()
+        # Create a new current revision
+        r = revision(document=base_rev.document, is_approved=True)
+        r.save()
+        d = Document.objects.get(pk=base_rev.document.id)
+        eq_(r, base_rev.document.current_revision)
+
+        uri = reverse('wiki.new_revision_based_on',
+                      locale=d.locale,
+                      args=[d.slug, base_rev.id])
+        response = self.client.get(uri)
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(doc('#id_content')[0].value, base_rev.content)
+
+
+def _test_form_maintains_based_on_rev(client, doc, view, post_data,
+                                      trans_lang=None, locale=None):
+    """Confirm that the based_on value set in the revision created by an edit
+    or translate form is the current_revision of the document as of when the
+    form was first loaded, even if other revisions have been approved in the
+    meantime."""
+    if trans_lang:
+        translate_path = doc.slug
+        uri = urllib.quote(reverse('wiki.translate',
+                                   locale=trans_lang,
+                                   args=[translate_path]))
+    else:
+        uri = reverse(view, locale=locale, args=[doc.slug])
+    response = client.get(uri)
+    orig_rev = doc.current_revision
+    eq_(orig_rev.id,
+        int(pq(response.content)('input[name=based_on]').attr('value')))
+
+    # While Fred is editing the above, Martha approves a new rev:
+    martha_rev = revision(document=doc)
+    martha_rev.is_approved = True
+    martha_rev.save()
+
+    # Then Fred saves his edit:
+    post_data_copy = {'based_on': orig_rev.id, 'slug': orig_rev.slug}
+    post_data_copy.update(post_data)  # Don't mutate arg.
+    response = client.post(uri,
+                           data=post_data_copy)
+    ok_(response.status_code in (200, 302))
+    fred_rev = Revision.objects.all().order_by('-id')[0]
+    eq_(orig_rev, fred_rev.based_on)
+
+
+class ArticlePreviewTests(UserTestCase, WikiTestCase):
+    """Tests for preview view and template."""
+    localizing_client = True
+
+    def setUp(self):
+        super(ArticlePreviewTests, self).setUp()
+        self.client.login(username='testuser', password='testpass')
+
+    def test_preview_GET_405(self):
+        """Preview with HTTP GET results in 405."""
+        response = self.client.get(reverse('wiki.preview'), follow=True)
+        eq_(405, response.status_code)
+
+    def test_preview(self):
+        """Preview the wiki syntax content."""
+        response = self.client.post(reverse('wiki.preview'),
+                                    {'content': '<h1>Test Content</h1>'},
+                                    follow=True)
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_('Test Content', doc('article#wikiArticle h1').text())
+
+    @pytest.mark.xfail(reason='broken test')
+    def test_preview_locale(self):
+        """Preview the wiki syntax content."""
+        # Create a test document and translation.
+        d = _create_document()
+        _create_document(title='Prueba', parent=d, locale='es')
+        # Preview content that links to it and verify link is in locale.
+        url = reverse('wiki.preview', locale='es')
+        response = self.client.post(url, {'content': '[[Test Document]]'})
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        link = doc('#doc-content a')
+        eq_('Prueba', link.text())
+        eq_('/es/docs/prueba', link[0].attrib['href'])
+
+
+class SelectLocaleTests(UserTestCase, WikiTestCase):
+    """Test the locale selection page"""
+
+    def setUp(self):
+        super(SelectLocaleTests, self).setUp()
+        self.d = _create_document()
+        self.client.login(username='admin', password='testpass')
+
+    def test_page_renders_locales(self):
+        """Load the page and verify it contains all the locales for l10n."""
+        response = self.client.get(reverse('wiki.select_locale',
+                                           args=[self.d.slug]),
+                                   follow=True)
+
+        eq_(200, response.status_code)
+        doc = pq(response.content)
+        eq_(len(settings.LANGUAGES) - 1,  # All except for 1 (en-US)
+            len(doc('#select-locale ul.locales li')))
+
+
+def _create_document(title='Test Document', parent=None,
+                     locale=settings.WIKI_DEFAULT_LANGUAGE):
+    d = document(title=title, html='<div>Lorem Ipsum</div>',
+                 locale=locale, parent=parent, is_localizable=True)
+    d.save()
+    r = Revision(document=d, keywords='key1, key2', summary='lipsum',
+                 content='<div>Lorem Ipsum</div>', creator_id=8,
+                 is_approved=True,
+                 comment="Good job!")
+    r.save()
+    return d
+
+
+def _translation_data():
+    return {
+        'title': 'Un Test Articulo',
+        'slug': 'un-test-articulo',
+        'tags': 'tagUno,tagDos,tagTres',
+        'keywords': 'keyUno, keyDos, keyTres',
+        'summary': 'lipsumo',
+        'content': 'loremo ipsumo doloro sito ameto',
+        'toc_depth': Revision.TOC_DEPTH_H4,
+    }
+
+
+@pytest.mark.parametrize('doc_name', ['root', 'bottom', 'de', 'fr', 'it'])
+def test_zone_styles(client, doc_hierarchy_with_zones, root_doc, doc_name):
+    """
+    Check document page for zone-style-related features.
+    """
+    zone_title = 'a.zone-parent'
+    css_link = 'link[type="text/css"][href$="build/styles/{}.css"]'
+
+    if doc_name == 'root':
+        doc = root_doc
+    elif doc_name == 'bottom':
+        doc = doc_hierarchy_with_zones.bottom
+        zone_title = 'a.zone-parent[href="{}"]'.format(
+            doc_hierarchy_with_zones.middle_top.get_absolute_url()
+        )
+    else:
+        doc = doc_hierarchy_with_zones.top.translations.get(locale=doc_name)
+
+    url = reverse('wiki.document', args=(doc.slug,), locale=doc.locale)
+    response = client.get(url, follow=True)
+    response_html = pq(response.content)
+
+    def count(selector):
+        return len(response_html.find(selector))
+
+    def one_if(*args):
+        return 1 if any(arg == doc_name for arg in args) else 0
+
+    assert count('body.zone') == one_if('bottom', 'de', 'fr', 'it')
+    assert count('body.zone-landing') == one_if('de', 'fr', 'it')
+    assert count('span.zone-parent') == one_if('de', 'fr', 'it')
+    assert (count('.document-title') ==
+            one_if('root', 'bottom', 'de', 'fr', 'it'))
+    assert count(zone_title) == one_if('bottom')
+    assert count('.crumbs') == one_if('root', 'bottom')
+    assert count(css_link.format('zones')) == one_if('it')
+    assert count(css_link.format('zone-bobby')) == one_if('bottom')
+    assert count(css_link.format('zone-berlin')) == one_if('de')
+    assert count(css_link.format('zone-lindsey')) == one_if('fr')
+
+
+@pytest.mark.parametrize("elem_num,has_prev,is_english,has_revert", [
+    (0, True, False, False),
+    (1, True, False, True),
+    (2, False, True, False)],
+    ids=['current', 'first_trans', 'en_source'])
+def test_list_revisions(elem_num, has_prev, is_english, has_revert,
+                        admin_client, trans_edit_revision):
+    """Check the three rows of the test translation.
+
+    Row 1: The latest edit of the translation
+    Row 2: The first translation into French
+    Row 3: The English revision that the first translation was based on
+    """
+    doc = trans_edit_revision.document
+    url = reverse('wiki.document_revisions', locale=doc.locale,
+                  args=[doc.slug])
+    response = admin_client.get(url)
+    assert response.status_code == 200
+
+    page = pq(response.content)
+    list_items = page('ul.revision-list li')
+
+    # Select the list item and revision requested in the test
+    li_element = list_items[elem_num]
+    revision = trans_edit_revision
+    num = 0
+    while num < elem_num:
+        revision = revision.previous
+        num += 1
+    rev_doc = revision.document
+
+    # The date text links to the expected revision page
+    revision_url = reverse('wiki.revision',
+                           locale=rev_doc.locale,
+                           args=[rev_doc.slug, revision.id])
+    rev_link = li_element.cssselect('.revision-list-date')[0].find('a')
+    assert rev_link.attrib['href'] == revision_url
+
+    # Check if there is a previous link
+    prev_link = li_element.cssselect('.revision-list-prev')[0].find('a')
+    if has_prev:
+        assert prev_link is not None
+        with translation.override(doc.locale):
+            expected = translation.gettext('Previous').decode('utf8')
+        assert prev_link.text == expected
+    else:
+        assert prev_link is None
+
+    # The comment has a marker if it is the English source page
+    comment_em = li_element.cssselect('.revision-list-comment')[0].find('em')
+    if is_english:
+        assert li_element.attrib['class'] == 'revision-list-en-source'
+        with translation.override(doc.locale):
+            expected = translation.gettext('English (US)').decode('utf8')
+        assert comment_em.text == expected
+    else:
+        assert li_element.attrib.get('class') is None
+        assert comment_em is None
+
+    # The revert button is included if it makes sense for the revision
+    revert = li_element.cssselect('.revision-list-revert')
+    if has_revert:
+        assert len(revert) == 1
+    else:
+        assert len(revert) == 0
