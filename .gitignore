@@ -2,6 +2,7 @@
 .idea
 *.pyc
 token_ngram/code_corpus.txt
+token_ngram/code_corpus.arpa
 token_ngram/common_words.pickle
 token_ngram/vocabulary.pickle
 token_ngram/kenlm
