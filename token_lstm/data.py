@@ -32,8 +32,8 @@ class Corpus(object):
                     pass
 
         self.dictionary = Dictionary()
-        self.train = self.tokenize(os.path.join(path, '../dataset/tf_train_100.txt'))
-        self.valid = self.tokenize(os.path.join(path, '../dataset/tf_train_100.txt'))
+        self.train = self.tokenize(os.path.join(path, '../dataset/tf_train.txt'))
+        self.valid = self.tokenize(os.path.join(path, '../dataset/tf_train.txt'))
         # self.test = self.tokenize(os.path.join(path, '../dataset/tiny_test.txt'))
         
 
@@ -71,7 +71,8 @@ class Corpus(object):
                         for word in words:
                             ids[token] = self.dictionary.word2idx[word]
                             token += 1
-                except:
+                except Exception as e:
+                    #raise e
                     pass
         return ids
 

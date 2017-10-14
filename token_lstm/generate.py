@@ -58,7 +58,7 @@ def load(filename):
     return model, corpus
 
 def test(model,corpus,code,suggestion=3):
-    global indent
+    global hidden,indent
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(1)
     input = Variable(torch.rand(1, 1).mul(ntokens).long(), volatile=True)
@@ -96,7 +96,6 @@ def test(model,corpus,code,suggestion=3):
 
 def generate(model, corpus, tokens = ""):
     global hidden,indent
-    test(model, corpus, tokens)
     symbols = ['.','(',')',',','[',']','{','}']
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(1)
@@ -105,30 +104,20 @@ def generate(model, corpus, tokens = ""):
         input.data = input.data.cuda()
     with open(args.outf, 'w') as outf:
         outf.write(tokens)
-        prev_word = None
+        prev_word = (None,None)
         for i in range(args.words):
             output, hidden = model(input, hidden)
             word_weights = output.squeeze().data.div(args.temperature).exp().cpu()
-            word_idx = torch.multinomial(word_weights, 1)[0]
+            word_idx = torch.topk(word_weights, 1)[1][0]
             input.data.fill_(word_idx)
             word = corpus.dictionary.idx2word[word_idx]
-            if word[0] == 5:
-                indent += 1
-                word = word[1]
-            elif word[0] == 6:
-                indent -= 1
-                word = word[1]
-            elif word[1] == '\n':
-                word = '\n' + ' ' * 4 * indent
-            else:
-                word = word[1]
-            outf.write((('' if word in symbols  or prev_word in symbols else ' '))+word)
+            outf.write((('' if word[1] in symbols  or prev_word[1] in symbols else ' '))+word[1])
             prev_word = word
             if i % args.log_interval == 0:
                 print('| Generated {}/{} words'.format(i, args.words))
 if __name__ == '__main__':
     # f = open('../raw_data/10729_annotations.py','r')
     model, corpus = load(args.checkpoint)
-    print test(model, corpus, '''for i in range(100):
-    print 1''',40)
-    # generate(model, corpus, "import tensorflow")
+    #print test(model, corpus, '''for i in range(100):
+    #print 1''',40)
+    generate(model, corpus, "")
