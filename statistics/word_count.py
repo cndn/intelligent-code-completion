@@ -3,9 +3,9 @@ import os
 import sys
 sys.path.append('../tokenizer')
 import tokenizer
-def word_count(train):
+def word_count(train, out):
     d = {}
-    output = open('word_count.txt','w')
+    output = open(out,'w')
     with open(train,'r') as f:
         for i, line in enumerate(f):
             if i % 1000 == 0:
@@ -24,9 +24,9 @@ def word_count(train):
     for item in sorted(d.items(), key=operator.itemgetter(1), reverse=True):
         if len(item[0]) > 10:
             continue
-        output.write(item[0] + '\t' + str(item[1]) + '\n')
+        output.write(str(item[0]) + '\t' + str(item[1]) + '\n')
 
 if __name__ == '__main__':
-    naive_word_count('../dataset/train.txt')
+    word_count('../dataset/tf_train.txt', 'tf_count_with_type.txt')
                 
 
