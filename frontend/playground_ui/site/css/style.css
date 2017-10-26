@@ -1,0 +1,48 @@
+body: {
+    width: 100%;
+}
+
+.navbar-brand {
+    padding: 5px 15px;
+}
+
+#records_filter {
+    float: left;
+    padding-top: .25em;
+}
+
+#brand-image {
+    padding: 0px;
+}
+
+div#content {
+    width: 100%;
+}
+
+div#source-pane {
+    float: left;
+    width: 50%;
+}
+
+.CodeMirror {
+    border: 1px solid black;
+}
+div#output-pane {
+    float: right;
+    width: 50%;
+}
+
+div#submit-container {
+    float: right;
+}
+
+div#button-row {
+    margin-top: 20px;
+}
+
+#output {
+    color: black;
+    font-family: monospace;
+    width: 100%;
+    height: 50vh;
+}

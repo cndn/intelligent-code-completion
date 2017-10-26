@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+
+<html>
+
+  <head>
+    <meta charset="utf-8" />
+    <title>Python Explorer</title>
+    <link rel="stylesheet" type="text/css" href="css/bootstrap.min.css">
+    <link rel="stylesheet" type="text/css" href="css/codemirror.css" />
+    <link rel="stylesheet" type="text/css" href="css/style.css">
+    <link rel="stylesheet" type="text/css" href="css/eclipse.css" />
+
+    <script src="js/jquery-3.1.1.min.js"></script>
+    <script src="js/bootstrap.min.js"></script>
+    <script src="js/codemirror.js"></script>
+    <script src="js/syntax/python.js"></script>
+    <script src="js/python.js"></script>
+  </head>
+
+  <body style="padding-top: 70px">
+
+    <nav class="navbar navbar-default navbar-fixed-top">
+      <div class="container-fluid">
+
+        <div class="navbar-header">
+          <a class="navbar-brand" href="/">
+            <img id="brand-image" alt="Cloud Computing" src="images/tpz.png">
+          </a>
+        </div>
+
+        <div class="collapse navbar-collapse" id="bs-example-navbar-collapse-1">
+          <ul class="nav navbar-nav nav-pills">
+            <li  class="active"><a href="/python">Python <span class="sr-only">(current)</span></a></li>
+          </ul>
+        </div>
+      </div>
+    </nav> <!-- END NAV -->
+
+    <div id="content" class="container">
+
+      <div id="alert-container">
+        <div class="alert alert-danger" role="alert" style="display:none" id="alert-danger">
+          <button type="button" class="close" aria-label="Close"><span aria-hidden="true">&times</span></button>
+          <div id="errorMessage"></div>
+        </div>
+      </div> <!-- END ALERT CONTAINER -->
+
+      <div id="source-pane" class="container">
+        <h5>Python Code</h5>
+
+        <div id="source-form-container">
+          <form id="source-form">
+            <div id="source">
+              <textarea name="code" id="code"></textarea>
+            </div>
+            <div id="button-row">
+              <div id="submit-container">
+                <button id="submit" type="button" class="btn btn-default">Submit</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div> <!-- END SOURCE PANE -->
+
+      <div id="output-pane" class="container">
+        <h5>Output</h5>
+        <div id="output-container">
+            <textarea name="output" id="output"></textarea>
+          </div>
+      </div> <!-- END OUTPUT PANE -->
+
+    </div> <!-- END CONTENT -->
+
+  </body>
+</html>
