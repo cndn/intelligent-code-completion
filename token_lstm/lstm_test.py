@@ -56,6 +56,7 @@ class Test(object):
             else:
                 self.model.cpu()
             self.corpus = data.Corpus(args.data,wc_filename)
+        print 'loaded!'
 
     def postprocess(self, word_idx, suggestion=1):
         # top 1 suggestion
