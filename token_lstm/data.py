@@ -4,6 +4,9 @@ import sys
 sys.path.append('../tokenizer')
 import tokenizer
 import operator
+import random
+
+
 class Dictionary(object):
     def __init__(self):
         self.word2idx = {}
@@ -21,6 +24,8 @@ class Dictionary(object):
 
 class Corpus(object):
     def __init__(self, path, word_count):
+        self.pseudo_count = 10
+        # print word_count
         self.vocab = set()
         with open(word_count, 'r') as f:
             for line in f.xreadlines():
@@ -30,7 +35,7 @@ class Corpus(object):
                         self.vocab.add(w)
                 except:
                     pass
-
+        
         self.dictionary = Dictionary()
         self.train = self.tokenize(os.path.join(path, '../dataset/tf_train_100.txt'))
         self.valid = self.tokenize(os.path.join(path, '../dataset/tf_train_100.txt'))
@@ -45,12 +50,15 @@ class Corpus(object):
         with open(path, 'r') as f:
             for i, line in enumerate(f):
                 filename = line.strip()
+                pseudo_words = range(self.pseudo_count)
+                random.shuffle(pseudo_words)
                 code_path = '../raw_data/' + filename
                 assert os.path.exists(code_path)
                 try:
                     with open(code_path, 'r') as code_f:
                         code = code_f.read()
-                        words = tokenizer.tokenize_wrapper(code, self.vocab) + ['<eos>']
+                        kwargs = {'vocab':self.vocab,'pseudo_words':pseudo_words,'p_dict':{}}
+                        words = tokenizer.tokenize_wrapper(code, **kwargs) + ['<eos>']
                         tokens += len(words)
                         for word in words:
                             self.dictionary.add_word(word)
@@ -62,12 +70,15 @@ class Corpus(object):
             token = 0
             for line in f:
                 filename = line.strip()
+                pseudo_words = range(self.pseudo_count)
+                random.shuffle(pseudo_words)
                 code_path = '../raw_data/' + filename
                 assert os.path.exists(code_path)
                 try:
                     with open(code_path, 'r') as code_f:
                         code = code_f.read()
-                        words = tokenizer.tokenize_wrapper(code, self.vocab) + ['<eos>']
+                        kwargs = {'vocab':self.vocab,'pseudo_words':pseudo_words,'p_dict':{}}
+                        words = tokenizer.tokenize_wrapper(code, **kwargs) + ['<eos>']
                         for word in words:
                             ids[token] = self.dictionary.word2idx[word]
                             token += 1
@@ -77,4 +88,4 @@ class Corpus(object):
 
 if __name__ == '__main__':
     corpus = Corpus('','../statistics/tf_count_with_type.txt')
-    print len(corpus.dictionary)
+    print corpus.dictionary.idx2word

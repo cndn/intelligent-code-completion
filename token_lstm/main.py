@@ -57,6 +57,8 @@ if torch.cuda.is_available():
 # Load data
 ###############################################################################
 corpus = data.Corpus(args.data, '../statistics/tf_count_with_type.txt')
+print 'ntokens: %d' %len(corpus.dictionary)
+
 def batchify(data, bsz):
     # Work out how cleanly we can divide the dataset into bsz parts.
     nbatch = data.size(0) // bsz
@@ -78,9 +80,10 @@ val_data = batchify(corpus.valid, eval_batch_size)
 ###############################################################################
 
 ntokens = len(corpus.dictionary)
-# model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied)
-with open(args.checkpoint, 'rb') as f:
-    model = torch.load(f)
+
+model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied)
+# with open(args.checkpoint, 'rb') as f:
+#     model = torch.load(f)
 if args.cuda:
     model.cuda()
 
