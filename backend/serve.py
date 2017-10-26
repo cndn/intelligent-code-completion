@@ -2,8 +2,9 @@ import os
 import torch
 import sys
 sys.path.append('../token_lstm')
-from flask import Flask, jsonify, request
-from generate import *
+from flask import Flask, jsonify, request, make_response
+from lstm_test import *
+import json
 
 app = Flask(__name__)
 
@@ -11,20 +12,22 @@ model = torch.load('../token_lstm/model.pt')
 
 def get_args(req):
     if request.method == 'POST':
-        args = request.json
+        args = request.json.data
     elif request.method == "GET":
-        args = request.args
+        args = request.data
     return args
 
-model, corpus = load('../token_lstm/model.pt')
+t = Test()
+t.load(model_filename='../token_lstm/model.pt')
 @app.route("/predict", methods=["GET", "POST", "OPTIONS"])
 
 def predict():
-    args = get_args(request)
-    sentence = args.get("sentence", "from ")
-    suggestions = test(model, corpus, sentence)
-    print suggestions
-    return jsonify({"data": {"results": suggestions}})
+    sentence = get_args(request)
+    suggestions = t.predict_next(sentence)
+    js = json.dumps({"stdout":sentence+str(suggestions[0])})
+    resp = make_response(js)
+    resp.headers['Content-type'] = 'application/json'
+    return resp
 
 
 def main(host="127.0.0.1", port=9078):

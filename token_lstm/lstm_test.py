@@ -46,6 +46,7 @@ class Test(object):
         self.indent = 0
         self.model = None
         self.corpus = None
+        self.pseudo_count = 10
 
     def load(self, model_filename = args.checkpoint, wc_filename='../statistics/tf_count_with_type.txt'):
         with open(model_filename, 'rb') as f:
@@ -84,7 +85,7 @@ class Test(object):
         input = Variable(torch.rand(1, 1).mul(ntokens).long(), volatile=True)
         if args.cuda:
             input.data = input.data.cuda()
-        pseudo_words = range(100)
+        pseudo_words = range(self.pseudo_count)
         random.shuffle(pseudo_words)
         kwargs = {'vocab':self.corpus.vocab,'pseudo_words':pseudo_words,'p_dict':{}}
         tokens = tokenizer.tokenize_wrapper(code,**kwargs)
