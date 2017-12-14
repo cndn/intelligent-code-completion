@@ -45,6 +45,8 @@ parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
 args = parser.parse_args()
 
+WORD_COUNT_FILE = '../statistics/count_without_type.txt'
+
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
@@ -53,11 +55,15 @@ if torch.cuda.is_available():
     else:
         torch.cuda.manual_seed(args.seed)
 
+
 ###############################################################################
 # Load data
 ###############################################################################
-corpus = data.Corpus(args.data, '../statistics/tf_count_with_type.txt')
+corpus = data.Corpus(args.data, WORD_COUNT_FILE)
 print 'ntokens: %d' %len(corpus.dictionary)
+
+tic_marks = corpus.tic_marks
+print sum(tic_marks)
 
 def batchify(data, bsz):
     # Work out how cleanly we can divide the dataset into bsz parts.
@@ -70,8 +76,9 @@ def batchify(data, bsz):
         data = data.cuda()
     return data
 
-eval_batch_size = 10
+eval_batch_size = 1
 train_data = batchify(corpus.train, args.batch_size)
+print train_data
 val_data = batchify(corpus.valid, eval_batch_size)
 # test_data = batchify(corpus.test, eval_batch_size)
 
@@ -101,7 +108,8 @@ def repackage_hidden(h):
 
 
 def get_batch(source, i, evaluation=False):
-    seq_len = min(args.bptt, len(source) - 1 - i)
+    seq_len = tic_marks[i]
+    # seq_len = min(args.bptt, len(source) - 1 - i)
     data = Variable(source[i:i+seq_len], volatile=evaluation)
     target = Variable(source[i+1:i+1+seq_len].view(-1))
     return data, target
@@ -113,7 +121,7 @@ def evaluate(data_source):
     total_loss = 0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(eval_batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
+    for i in range(len(tic_marks)):
         data, targets = get_batch(data_source, i, evaluation=True)
         output, hidden = model(data, hidden)
         output_flat = output.view(-1, ntokens)
@@ -129,10 +137,13 @@ def train():
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(args.batch_size)
-    print train_data.size(0)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        print i
+    # hidden = model.reset_hidden()
+    
+    s = 0
+    total = sum(tic_marks)
+    for i in range(len(tic_marks)):
         data, targets = get_batch(train_data, i)
+        s += data.size(0)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
@@ -147,16 +158,17 @@ def train():
             p.data.add_(-lr, p.grad.data)
 
         total_loss += loss.data
+        print '%d/%d' %(s, total)
 
-        if batch % args.log_interval == 0 and batch > 0:
-            cur_loss = total_loss[0] / args.log_interval
-            elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
-                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
-            total_loss = 0
-            start_time = time.time()
+        # if batch % args.log_interval == 0 and batch > 0:
+        #     cur_loss = total_loss[0] / args.log_interval
+        #     elapsed = time.time() - start_time
+        #     print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+        #             'loss {:5.2f} | ppl {:8.2f}'.format(
+        #         epoch, batch, len(train_data) // args.bptt, lr,
+        #         elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
+        #     total_loss = 0
+        #     start_time = time.time()
 
 # Loop over epochs.
 lr = args.lr
