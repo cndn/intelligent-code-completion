@@ -133,6 +133,8 @@ def generate(model, corpus, tokens = ""):
 if __name__ == '__main__':
     # f = open('../raw_data/10729_annotations.py','r')
     test = Test()
+    test.load('model.pt')
+    print 'here'
     print test.predict_next("for i in ")
     # model, corpus = load(args.checkpoint)
     # print test(model, corpus, "for i in ",40)
